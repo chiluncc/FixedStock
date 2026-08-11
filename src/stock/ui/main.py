@@ -1,5 +1,3 @@
-"""命令行入口：加载赛事配置、建立数据与输出路径。"""
-
 from __future__ import annotations
 
 import argparse

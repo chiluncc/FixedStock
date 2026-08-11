@@ -1,5 +1,3 @@
-"""本地数据构建：建库 + 抓取行情/财报/指数并落库。"""
-
 from __future__ import annotations
 
 import sqlite3
@@ -14,9 +12,16 @@ from stock.structures.config import Config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SCHEMA_DIR = PROJECT_ROOT / "schemas"
-SCHEMA_FILES = ("stock_basic.sql", "trade_calendar.sql", "daily_bar.sql", "financial_report.sql", "index_bar.sql")
+SCHEMA_FILES = (
+    "stock_basic.sql",
+    "trade_calendar.sql",
+    "daily_bar.sql",
+    "financial_report.sql",
+    "valuation_daily.sql",
+    "index_bar.sql",
+)
 DB_NAME = "market.db"
-REQUEST_INTERVAL = 8.0
+REQUEST_INTERVAL = 4.0
 HISTORY_YEARS = 5
 
 
@@ -241,6 +246,67 @@ def _fetch_index_daily(con: sqlite3.Connection, index_code: str, start_ts: int, 
 # ===========================================
 
 
+def _valuation(code: str, indicator: str) -> pd.DataFrame:
+    try:
+        df = ak.stock_zh_valuation_baidu(symbol=code, indicator=indicator, period="近五年")
+        if df.empty:
+            raise ValueError("估值接口返回空数据")
+        return pd.DataFrame(
+            {
+                "date": pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d"),
+                "value": pd.to_numeric(df["value"], errors="coerce"),
+            }
+        ).dropna(subset=["date"])
+    finally:
+        time.sleep(REQUEST_INTERVAL)
+
+
+def _fetch_stock_valuation(con: sqlite3.Connection, code: str, start_needed_ts: int, end_ts: int) -> bool:
+    row = con.execute(
+        "SELECT MIN(date), MAX(date) FROM valuation_daily WHERE code = ?", (code,)
+    ).fetchone()
+    if row is None or row[0] is None:
+        window = start_needed_ts, end_ts
+    else:
+        min_ts, max_ts = row
+        if max_ts < end_ts and min_ts > start_needed_ts:
+            window = start_needed_ts, end_ts
+        elif max_ts < end_ts:
+            window = max_ts + 86400, end_ts
+        elif min_ts > start_needed_ts:
+            window = start_needed_ts, min_ts - 86400
+        else:
+            return True
+    if window[0] > window[1]:
+        return True
+    try:
+        pe = _valuation(code, "市盈率(TTM)")
+        pb = _valuation(code, "市净率")
+        merged = pe.merge(pb, on="date", suffixes=("_pe", "_pb"))
+        start_ts, end_window_ts = window
+        rows = []
+        for r in merged.itertuples(index=False):
+            ts = _to_ts(r.date)
+            if not (start_ts <= ts <= end_window_ts):
+                continue
+            pe_v = None if pd.isna(r.value_pe) else float(r.value_pe)
+            pb_v = None if pd.isna(r.value_pb) else float(r.value_pb)
+            if pe_v is None and pb_v is None:
+                continue
+            rows.append((code, ts, pe_v, pb_v, None))
+        con.executemany(
+            "INSERT OR REPLACE INTO valuation_daily(code, date, pe_ttm, pb, total_mv) VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+        con.commit()
+        return True
+    except Exception:
+        return False
+
+
+# ===========================================
+
+
 def _daily_fetch_window(
     con: sqlite3.Connection, code: str, start_needed_ts: int, end_ts: int
 ) -> tuple[int, int] | None:
@@ -322,6 +388,11 @@ def _rebuild_views(con: sqlite3.Connection, cutoff_ts: int, config: Config) -> N
         f"f.gross_margin, f.debt_ratio "
         f"FROM financial_report f JOIN v_stock_basic s ON s.code = f.code "
         f"WHERE f.report_date < {cutoff_ts}",
+        "DROP VIEW IF EXISTS v_valuation_daily",
+        f"CREATE VIEW v_valuation_daily AS "
+        f"SELECT v.code, v.date, v.pe_ttm, v.pb, v.total_mv "
+        f"FROM valuation_daily v JOIN v_stock_basic s ON s.code = v.code "
+        f"WHERE v.date < {cutoff_ts}",
     ]
     for statement in statements:
         con.execute(statement)
@@ -370,6 +441,7 @@ def _fetch_data(config: Config) -> None:
                 year = _financial_fetch_year(con, code, cutoff_ts, start_needed_year)
                 if year is not None:
                     _fetch_stock_financial(con, code, cutoff_ts, str(year))
+                _fetch_stock_valuation(con, code, start_needed_ts, end_ts)
 
         for index_code in ("000300", "000905"):
             window = _index_fetch_window(con, index_code, start_needed_ts, end_ts)
