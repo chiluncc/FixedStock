@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import akshare as ak
 import pandas as pd
 
 from stock.structures.config import Config
+from stock.utils.file_handles import get_logger
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SCHEMA_DIR = PROJECT_ROOT / "schemas"
@@ -21,7 +22,7 @@ SCHEMA_FILES = (
     "index_bar.sql",
 )
 DB_NAME = "market.db"
-REQUEST_INTERVAL = 4.0
+REQUEST_INTERVAL = 2.0
 HISTORY_YEARS = 5
 
 
@@ -33,6 +34,12 @@ def _db_path(local_data_dir: Path) -> Path:
     path = local_data_dir if local_data_dir.is_absolute() else Path.cwd() / local_data_dir
     path.mkdir(parents=True, exist_ok=True)
     return path / DB_NAME
+
+
+def _log_path(output_dir: Path) -> Path:
+    path = output_dir if output_dir.is_absolute() else Path.cwd() / output_dir
+    path.mkdir(parents=True, exist_ok=True)
+    return path / "logging.log"
 
 
 # ===========================================
@@ -119,11 +126,18 @@ def _daily_sina(code: str, start: str, end: str) -> pd.DataFrame:
 
 
 def _fetch_stock_daily(con: sqlite3.Connection, code: str, start: str, end: str) -> bool:
-    try:
+    df = None
+    errors: list[Exception] = []
+    for source in (_daily_em, _daily_sina):
         try:
-            df = _daily_em(code, start, end)
-        except Exception:
-            df = _daily_sina(code, start, end)
+            df = source(code, start, end)
+            break
+        except Exception as exc:
+            errors.append(exc)
+            time.sleep(REQUEST_INTERVAL)
+    if df is None:
+        return any(isinstance(e, ValueError) for e in errors)
+    try:
         df = df.dropna(subset=["date", "close"])
         rows = [
             (code, _to_ts(r.date), float(r.open), float(r.high), float(r.low), float(r.close),
@@ -269,11 +283,11 @@ def _fetch_stock_valuation(con: sqlite3.Connection, code: str, start_needed_ts: 
         window = start_needed_ts, end_ts
     else:
         min_ts, max_ts = row
-        if max_ts < end_ts and min_ts > start_needed_ts:
+        if max_ts + 86400 < end_ts and min_ts - 86400 > start_needed_ts:
             window = start_needed_ts, end_ts
-        elif max_ts < end_ts:
+        elif max_ts + 86400 < end_ts:
             window = max_ts + 86400, end_ts
-        elif min_ts > start_needed_ts:
+        elif min_ts - 86400 > start_needed_ts:
             window = start_needed_ts, min_ts - 86400
         else:
             return True
@@ -415,9 +429,22 @@ def _build_local_database(local_data_dir: Path) -> None:
 
 def _fetch_data(config: Config) -> None:
     con = sqlite3.connect(_db_path(config.local_data_dir))
+    logger = get_logger(_log_path(config.output_dir))
     try:
-        _fetch_trade_calendar(con)
-        _init_stock_basic(con, config)
+        total = sum(len(codes) for codes in config.stocks.values())
+
+        logger.info("开始构建 trade_calendar")
+        if not _fetch_trade_calendar(con):
+            logger.warning("trade_calendar 构建失败")
+        else:
+            rows = con.execute("SELECT COUNT(*) FROM trade_calendar").fetchone()[0]
+            logger.info("trade_calendar 构建完成: %d 个交易日", rows)
+
+        logger.info("开始构建 stock_basic（%d 只）", total)
+        if not _init_stock_basic(con, config):
+            logger.warning("stock_basic 构建失败（名称接口异常，保留旧登记）")
+        else:
+            logger.info("stock_basic 构建完成: %d 只", total)
 
         cutoff_ts = _to_ts(config.time_start.strftime("%Y-%m-%d"))
         start_needed_ts = cutoff_ts - 365 * HISTORY_YEARS * 86400
@@ -428,27 +455,74 @@ def _fetch_data(config: Config) -> None:
         if end_ts is None:
             end_ts = cutoff_ts - 86400
 
+        logger.info("开始构建 daily_bar")
+        daily_fail: list[str] = []
         for codes in config.stocks.values():
             for code in codes:
                 window = _daily_fetch_window(con, code, start_needed_ts, end_ts)
-                if window is not None:
-                    start_ts, end_window_ts = window
-                    _fetch_stock_daily(
-                        con, code,
-                        datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime("%Y%m%d"),
-                        datetime.fromtimestamp(end_window_ts, tz=timezone.utc).strftime("%Y%m%d"),
-                    )
-                year = _financial_fetch_year(con, code, cutoff_ts, start_needed_year)
-                if year is not None:
-                    _fetch_stock_financial(con, code, cutoff_ts, str(year))
-                _fetch_stock_valuation(con, code, start_needed_ts, end_ts)
+                if window is not None and not _fetch_stock_daily(
+                    con,
+                    code,
+                    datetime.fromtimestamp(window[0], tz=timezone.utc).strftime("%Y%m%d"),
+                    datetime.fromtimestamp(window[1], tz=timezone.utc).strftime("%Y%m%d"),
+                ):
+                    daily_fail.append(code)
+        if daily_fail:
+            logger.warning("daily_bar 失败: %s", ", ".join(daily_fail))
+        logger.info(
+            "daily_bar 构建完成: 成功 %d/%d%s",
+            total - len(daily_fail),
+            total,
+            f"，失败 {len(daily_fail)} 只" if daily_fail else "",
+        )
 
+        logger.info("开始构建 financial_report")
+        fin_fail: list[str] = []
+        for codes in config.stocks.values():
+            for code in codes:
+                year = _financial_fetch_year(con, code, cutoff_ts, start_needed_year)
+                if year is not None and not _fetch_stock_financial(con, code, cutoff_ts, str(year)):
+                    fin_fail.append(code)
+        if fin_fail:
+            logger.warning("financial_report 失败: %s", ", ".join(fin_fail))
+        logger.info(
+            "financial_report 构建完成: 成功 %d/%d%s",
+            total - len(fin_fail),
+            total,
+            f"，失败 {len(fin_fail)} 只" if fin_fail else "",
+        )
+
+        logger.info("开始构建 valuation_daily")
+        val_fail: list[str] = []
+        for codes in config.stocks.values():
+            for code in codes:
+                if not _fetch_stock_valuation(con, code, start_needed_ts, end_ts):
+                    val_fail.append(code)
+        if val_fail:
+            logger.warning("valuation_daily 失败: %s", ", ".join(val_fail))
+        logger.info(
+            "valuation_daily 构建完成: 成功 %d/%d%s",
+            total - len(val_fail),
+            total,
+            f"，失败 {len(val_fail)} 只" if val_fail else "",
+        )
+
+        logger.info("开始构建 index_bar")
+        index_fail: list[str] = []
         for index_code in ("000300", "000905"):
             window = _index_fetch_window(con, index_code, start_needed_ts, end_ts)
-            if window is not None:
-                _fetch_index_daily(con, index_code, *window)
+            if window is not None and not _fetch_index_daily(con, index_code, *window):
+                index_fail.append(index_code)
+        if index_fail:
+            logger.warning("index_bar 失败: %s", ", ".join(index_fail))
+        logger.info(
+            "index_bar 构建完成: 成功 %d/2%s",
+            2 - len(index_fail),
+            f"，失败 {len(index_fail)} 个" if index_fail else "",
+        )
 
         _rebuild_views(con, cutoff_ts, config)
+        logger.info("视图重建完成: v_stock_basic / v_trade_calendar / v_daily_bar / v_index_bar / v_financial_report / v_valuation_daily")
     finally:
         con.close()
 
