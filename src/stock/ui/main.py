@@ -57,19 +57,28 @@ def main(argv: list[str] | None = None) -> None:
         output_dir = _resolve(config.output_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
-        prepare_local_data(config)
+
+        success = prepare_local_data(config)
 
         total = sum(len(codes) for codes in config.stocks.values())
-        table = Table(title="数据初始化结果", show_header=False, title_justify="left")
+        title = "[bold green]数据初始化成功[/bold green]" if success else "[bold red]数据初始化失败[/bold red]"
+        table = Table(title=title, show_header=False, title_justify="left")
         table.add_column("项目", style="bold cyan")
         table.add_column("内容")
-        table.add_row("初始化", "成功")
+        table.add_row("初始化", "成功" if success else "失败")
         table.add_row("股票数量", f"{total} 只（{len(config.stocks)} 个板块）")
         table.add_row("买入日期", str(config.time_start.date()))
         table.add_row("持股时长", f"{config.time_position} 个交易日")
         table.add_row("数据目录", str(data_dir))
         table.add_row("输出目录", str(output_dir))
         console.print(table)
+        if not success:
+            sys.exit(1)
+
+        # success = generate_analysis_data(config)
+
+        pass
+
     except Exception as exc:
         console.print(f"[bold red]错误: {exc}[/bold red]")
         sys.exit(1)
