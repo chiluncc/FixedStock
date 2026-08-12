@@ -3,11 +3,12 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import akshare as ak
 import pandas as pd
+from tickflow import TickFlow
 
 from stock.structures.config import Config
 from stock.utils.file_handles import get_logger
@@ -254,11 +255,67 @@ def _fetch_daily_sina(code: str, start: str, end: str, logger: logging.Logger) -
     )
 
 
+def _fetch_daily_tickflow(code: str, start: str, end: str, logger: logging.Logger) -> pd.DataFrame | None:
+    suffix = ".SH" if code.startswith("6") else ".SZ"
+    bj_tz = timezone(timedelta(hours=8))
+    start_ms = int(datetime.strptime(start, "%Y%m%d").replace(tzinfo=bj_tz).timestamp() * 1000)
+    end_ms = int(datetime.strptime(end, "%Y%m%d").replace(tzinfo=bj_tz).timestamp() * 1000)
+    try:
+        client = TickFlow.free()
+        ts, opens, highs, lows, closes, volumes, amounts = [], [], [], [], [], [], []
+        while True:
+            data = client.klines.get(
+                code + suffix,
+                period="1d",
+                end_time=end_ms,
+                adjust="forward",
+            )
+            time.sleep(REQUEST_INTERVAL / 4)
+            if not data["timestamp"]:
+                break
+            ts.extend(data["timestamp"])
+            opens.extend(data["open"])
+            highs.extend(data["high"])
+            lows.extend(data["low"])
+            closes.extend(data["close"])
+            volumes.extend(data["volume"])
+            amounts.extend(data["amount"])
+            earliest = int(data["timestamp"][0])
+            if earliest <= start_ms:
+                break
+            end_ms = earliest - 1
+        if not ts:
+            return pd.DataFrame(columns=list(BAR_COLS))
+        raw = pd.DataFrame(
+            {"timestamp": ts, "open": opens, "high": highs, "low": lows,
+             "close": closes, "volume": volumes, "amount": amounts}
+        )
+        raw = raw[raw["timestamp"] >= start_ms].drop_duplicates(subset="timestamp").sort_values("timestamp")
+        bj = pd.to_datetime(raw["timestamp"], unit="ms", utc=True).dt.tz_convert(bj_tz)
+        return pd.DataFrame(
+            {
+                "date": bj.dt.strftime("%Y-%m-%d"),
+                "open": pd.to_numeric(raw["open"], errors="coerce"),
+                "high": pd.to_numeric(raw["high"], errors="coerce"),
+                "low": pd.to_numeric(raw["low"], errors="coerce"),
+                "close": pd.to_numeric(raw["close"], errors="coerce"),
+                "volume": pd.to_numeric(raw["volume"], errors="coerce") * 100,
+                "amount": pd.to_numeric(raw["amount"], errors="coerce"),
+                "turnover": float("nan"),
+            }
+        )
+    except Exception as exc:
+        logger.warning("%s TickFlow 日线失败: %s", code, exc)
+        return None
+
+
 def _insert_daily_bars(con: sqlite3.Connection, code: str, df: pd.DataFrame) -> None:
+    trading = set(r[0] for r in con.execute("SELECT trade_date FROM trade_calendar"))
     rows = [
         (code, _to_ts(r.date), float(r.open), float(r.high), float(r.low), float(r.close),
          float(r.volume), float(r.amount), float(r.turnover))
         for r in df.itertuples(index=False)
+        if _to_ts(r.date) in trading
     ]
     if rows:
         con.executemany(
@@ -287,7 +344,9 @@ def _build_daily_bar(config: Config) -> bool:
                     continue
                 start = datetime.fromtimestamp(window[0], tz=timezone.utc).strftime("%Y%m%d")
                 end = datetime.fromtimestamp(window[1], tz=timezone.utc).strftime("%Y%m%d")
-                df = _fetch_daily_em(code, start, end, logger)
+                df = _fetch_daily_tickflow(code, start, end, logger)
+                if df is None:
+                    df = _fetch_daily_em(code, start, end, logger)
                 if df is None:
                     df = _fetch_daily_sina(code, start, end, logger)
                 if df is None:
