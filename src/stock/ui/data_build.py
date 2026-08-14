@@ -24,7 +24,7 @@ SCHEMA_FILES = (
     "index_bar.sql",
 )
 DB_NAME = "market.db"
-REQUEST_INTERVAL = 2.0
+REQUEST_INTERVAL = 4.0
 HISTORY_YEARS = 5
 
 BAR_COLS = ("date", "open", "high", "low", "close", "volume", "amount", "turnover")
@@ -270,7 +270,7 @@ def _fetch_daily_tickflow(code: str, start: str, end: str, logger: logging.Logge
                 end_time=end_ms,
                 adjust="forward",
             )
-            time.sleep(REQUEST_INTERVAL / 4)
+            time.sleep(REQUEST_INTERVAL)
             if not data["timestamp"]:
                 break
             ts.extend(data["timestamp"])
@@ -469,9 +469,9 @@ def _build_financial_report(config: Config) -> bool:
                 year = _financial_fetch_year(con, code, cutoff_ts, start_needed_year)
                 if year is None:
                     continue
-                df = _fetch_financial_sina(code, str(year), logger)
+                df = _fetch_financial_ths(code, logger)
                 if df is None:
-                    df = _fetch_financial_ths(code, logger)
+                    df = _fetch_financial_sina(code, str(year), logger)
                 if df is None:
                     logger.warning("financial_report 构建失败: %s", code)
                     return False
