@@ -5,7 +5,6 @@ import sqlite3
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-
 import akshare as ak
 import pandas as pd
 from tickflow import TickFlow
@@ -23,7 +22,6 @@ SCHEMA_FILES = (
     "valuation_daily.sql",
     "index_bar.sql",
 )
-DB_NAME = "market.db"
 REQUEST_INTERVAL = 4.0
 HISTORY_YEARS = 5
 
@@ -43,7 +41,7 @@ def _to_ts(date_str: str) -> int:
 def _db_path(local_data_dir: Path) -> Path:
     path = local_data_dir if local_data_dir.is_absolute() else Path.cwd() / local_data_dir
     path.mkdir(parents=True, exist_ok=True)
-    return path / DB_NAME
+    return path / "market.db"
 
 
 def _log_path(output_dir: Path) -> Path:
@@ -95,7 +93,8 @@ def _rebuild_views(con: sqlite3.Connection, cutoff_ts: int, config: Config) -> N
         f"SELECT f.code, f.report_date, f.announce_date, f.roe, f.revenue_yoy, f.netprofit_yoy, "
         f"f.gross_margin, f.debt_ratio "
         f"FROM financial_report f JOIN v_stock_basic s ON s.code = f.code "
-        f"WHERE f.report_date < {cutoff_ts}",
+        f"WHERE f.report_date < {cutoff_ts} "
+        f"AND (f.announce_date IS NULL OR f.announce_date < {cutoff_ts})",
         "DROP VIEW IF EXISTS v_valuation_daily",
         f"CREATE VIEW v_valuation_daily AS "
         f"SELECT v.code, v.date, v.pe_ttm, v.pb, v.total_mv "
@@ -396,6 +395,36 @@ def _normalize_financial(df: pd.DataFrame, date_col: str, cols: dict[str, str]) 
     return out.dropna(subset=["report_date"])
 
 
+def _exchange_prefix(code: str) -> str:
+    return "sh" if code.startswith(("6", "9")) else "sz"
+
+
+def _fetch_financial_announce_dates(code: str, logger: logging.Logger) -> pd.DataFrame | None:
+    try:
+        df = ak.stock_financial_report_sina(stock=f"{_exchange_prefix(code)}{code}", symbol="利润表")
+    except Exception as exc:
+        logger.warning("%s 披露日期抓取失败: %s", code, exc)
+        return None
+    finally:
+        time.sleep(REQUEST_INTERVAL)
+    if df.empty or "报告日" not in df.columns or "公告日期" not in df.columns:
+        return pd.DataFrame(columns=["report_date", "announce_date"])
+    out = pd.DataFrame(
+        {
+            "report_date": pd.to_datetime(df["报告日"], errors="coerce").dt.strftime("%Y-%m-%d"),
+            "announce_date": pd.to_datetime(df["公告日期"], errors="coerce").dt.strftime("%Y-%m-%d"),
+        }
+    )
+    return out.dropna(subset=["report_date", "announce_date"]).drop_duplicates("report_date")
+
+
+def _announce_ts_map(df: pd.DataFrame) -> dict[int, int]:
+    mapping: dict[int, int] = {}
+    for r in df.itertuples(index=False):
+        mapping[_to_ts(r.report_date)] = _to_ts(r.announce_date)
+    return mapping
+
+
 def _fetch_financial_sina(code: str, start_year: str, logger: logging.Logger) -> pd.DataFrame | None:
     try:
         df = ak.stock_financial_analysis_indicator(symbol=code, start_year=start_year)
@@ -436,17 +465,25 @@ def _fetch_financial_ths(code: str, logger: logging.Logger) -> pd.DataFrame | No
     return _normalize_financial(df, "报告期", cols)
 
 
-def _insert_financial(con: sqlite3.Connection, code: str, df: pd.DataFrame, cutoff_ts: int) -> None:
+def _insert_financial(
+    con: sqlite3.Connection,
+    code: str,
+    df: pd.DataFrame,
+    cutoff_ts: int,
+    announce_map: dict[int, int] | None = None,
+) -> None:
+    announce_map = announce_map or {}
     rows = []
     for r in df.itertuples(index=False):
         ts = _to_ts(r.report_date)
         if ts > cutoff_ts:
             continue
+        announce_ts = announce_map.get(ts)
         values = [
             None if pd.isna(v) else float(v)
             for v in (r.roe, r.revenue_yoy, r.netprofit_yoy, r.gross_margin, r.debt_ratio)
         ]
-        rows.append((code, ts, None, *values))
+        rows.append((code, ts, announce_ts, *values))
     if rows:
         con.executemany(
             "INSERT OR REPLACE INTO financial_report(code, report_date, announce_date, roe, revenue_yoy, "
@@ -454,6 +491,16 @@ def _insert_financial(con: sqlite3.Connection, code: str, df: pd.DataFrame, cuto
             rows,
         )
         con.commit()
+
+
+def _update_financial_announce(con: sqlite3.Connection, code: str, announce_map: dict[int, int]) -> None:
+    if not announce_map:
+        return
+    con.executemany(
+        "UPDATE financial_report SET announce_date = ? WHERE code = ? AND report_date = ?",
+        [(announce_ts, code, report_ts) for report_ts, announce_ts in announce_map.items()],
+    )
+    con.commit()
 
 
 def _build_financial_report(config: Config) -> bool:
@@ -467,7 +514,18 @@ def _build_financial_report(config: Config) -> bool:
         for codes in config.stocks.values():
             for code in codes:
                 year = _financial_fetch_year(con, code, cutoff_ts, start_needed_year)
+                missing_announce = con.execute(
+                    "SELECT COUNT(*) FROM financial_report WHERE code = ? AND announce_date IS NULL",
+                    (code,),
+                ).fetchone()[0]
+                announce_map: dict[int, int] = {}
+                if year is not None or missing_announce:
+                    announce_df = _fetch_financial_announce_dates(code, logger)
+                    if announce_df is not None:
+                        announce_map = _announce_ts_map(announce_df)
                 if year is None:
+                    if announce_map:
+                        _update_financial_announce(con, code, announce_map)
                     continue
                 df = _fetch_financial_ths(code, logger)
                 if df is None:
@@ -475,7 +533,9 @@ def _build_financial_report(config: Config) -> bool:
                 if df is None:
                     logger.warning("financial_report 构建失败: %s", code)
                     return False
-                _insert_financial(con, code, df, cutoff_ts)
+                _insert_financial(con, code, df, cutoff_ts, announce_map)
+                if announce_map:
+                    _update_financial_announce(con, code, announce_map)
         logger.info("financial_report 构建完成: %d 只", total)
         return True
     finally:

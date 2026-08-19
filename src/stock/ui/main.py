@@ -5,22 +5,18 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-
 from rich.console import Console
 from rich.table import Table
 
 from stock.structures.config import Config
-from stock.ui.data_build import DB_NAME, prepare_local_data
+from stock.ui.data_build import prepare_local_data
+from stock.ui.data_analysis import generate_analysis_data
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "config.json"
 REQUIRED_KEYS = ("local_data_dir", "output_dir", "time_start", "time_position", "stocks")
 
 console = Console()
-
-
-def _resolve(path: Path) -> Path:
-    return path if path.is_absolute() else Path.cwd() / path
 
 
 def load_config(config_path: Path) -> Config:
@@ -53,31 +49,31 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         config = load_config(Path(args.config))
-        data_dir = _resolve(config.local_data_dir)
-        output_dir = _resolve(config.output_dir)
-        data_dir.mkdir(parents=True, exist_ok=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        config.local_data_dir.mkdir(parents=True, exist_ok=True)
+        config.output_dir.mkdir(parents=True, exist_ok=True)
 
-        success = prepare_local_data(config)
+        # success = prepare_local_data(config)
+        # total = sum(len(codes) for codes in config.stocks.values())
+        # title = "[bold green]数据初始化成功[/bold green]" if success else "[bold red]数据初始化失败[/bold red]"
+        # table = Table(title=title, show_header=False, title_justify="left")
+        # table.add_column("项目", style="bold cyan")
+        # table.add_column("内容")
+        # table.add_row("初始化", "成功" if success else "失败")
+        # table.add_row("股票数量", f"{total} 只（{len(config.stocks)} 个板块）")
+        # table.add_row("买入日期", str(config.time_start.date()))
+        # table.add_row("持股时长", f"{config.time_position} 个交易日")
+        # table.add_row("数据目录", str(data_dir))
+        # table.add_row("输出目录", str(output_dir))
+        # console.print(table)
+        # if not success:
+        #     sys.exit(1)
 
-        total = sum(len(codes) for codes in config.stocks.values())
-        title = "[bold green]数据初始化成功[/bold green]" if success else "[bold red]数据初始化失败[/bold red]"
-        table = Table(title=title, show_header=False, title_justify="left")
-        table.add_column("项目", style="bold cyan")
-        table.add_column("内容")
-        table.add_row("初始化", "成功" if success else "失败")
-        table.add_row("股票数量", f"{total} 只（{len(config.stocks)} 个板块）")
-        table.add_row("买入日期", str(config.time_start.date()))
-        table.add_row("持股时长", f"{config.time_position} 个交易日")
-        table.add_row("数据目录", str(data_dir))
-        table.add_row("输出目录", str(output_dir))
-        console.print(table)
+        success = generate_analysis_data(config)
         if not success:
+            console.print("[bold red]报告生成失败[/bold red]")
             sys.exit(1)
-
-        # success = generate_analysis_data(config)
-
-        pass
+        
+        console.print("[bold green]全部报告生成完成[/bold green]")
 
     except Exception as exc:
         console.print(f"[bold red]错误: {exc}[/bold red]")
