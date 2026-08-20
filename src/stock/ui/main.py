@@ -14,7 +14,7 @@ from stock.ui.data_analysis import generate_analysis_data
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "config.json"
-REQUIRED_KEYS = ("local_data_dir", "output_dir", "time_start", "time_position", "stocks")
+REQUIRED_KEYS = ("stocks",)
 
 console = Console()
 
@@ -29,11 +29,15 @@ def load_config(config_path: Path) -> Config:
         console.print(f"[bold red]错误: 配置缺少字段: {', '.join(missing)}[/bold red]")
         sys.exit(1)
     return Config(
-        local_data_dir=Path(raw["local_data_dir"]),
-        output_dir=Path(raw["output_dir"]),
         stocks=raw["stocks"],
-        time_start=datetime.strptime(raw["time_start"], "%Y-%m-%d"),
-        time_position=int(raw["time_position"]),
+        local_data_dir=Path(raw.get("local_data_dir", "data")),
+        output_dir=Path(raw.get("output_dir", "output")),
+        time_start=(
+            datetime.strptime(raw["time_start"], "%Y-%m-%d")
+            if "time_start" in raw
+            else datetime.now()
+        ),
+        time_position=int(raw.get("time_position", 20)),
         portfolio_power=float(raw.get("portfolio_power", 0.7)),
     )
 
@@ -53,21 +57,21 @@ def main(argv: list[str] | None = None) -> None:
         config.local_data_dir.mkdir(parents=True, exist_ok=True)
         config.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # success = prepare_local_data(config)
-        # total = sum(len(codes) for codes in config.stocks.values())
-        # title = "[bold green]数据初始化成功[/bold green]" if success else "[bold red]数据初始化失败[/bold red]"
-        # table = Table(title=title, show_header=False, title_justify="left")
-        # table.add_column("项目", style="bold cyan")
-        # table.add_column("内容")
-        # table.add_row("初始化", "成功" if success else "失败")
-        # table.add_row("股票数量", f"{total} 只（{len(config.stocks)} 个板块）")
-        # table.add_row("买入日期", str(config.time_start.date()))
-        # table.add_row("持股时长", f"{config.time_position} 个交易日")
-        # table.add_row("数据目录", str(config.local_data_dir))
-        # table.add_row("输出目录", str(config.output_dir))
-        # console.print(table)
-        # if not success:
-        #     sys.exit(1)
+        success = prepare_local_data(config)
+        total = sum(len(codes) for codes in config.stocks.values())
+        title = "[bold green]数据初始化成功[/bold green]" if success else "[bold red]数据初始化失败[/bold red]"
+        table = Table(title=title, show_header=False, title_justify="left")
+        table.add_column("项目", style="bold cyan")
+        table.add_column("内容")
+        table.add_row("初始化", "成功" if success else "失败")
+        table.add_row("股票数量", f"{total} 只（{len(config.stocks)} 个板块）")
+        table.add_row("买入日期", str(config.time_start.date()))
+        table.add_row("持股时长", f"{config.time_position} 个交易日")
+        table.add_row("数据目录", str(config.local_data_dir))
+        table.add_row("输出目录", str(config.output_dir))
+        console.print(table)
+        if not success:
+            sys.exit(1)
 
         success = generate_analysis_data(config)
         if not success:

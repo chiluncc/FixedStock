@@ -77,7 +77,7 @@ def _get_foundation_data(config: Config) -> list[StockReport]:
 
 def _save_date(config: Config, stocks: list[StockReport]) -> int:
     saved = 0
-    for stock in stocks:
+    for stock in tqdm(stocks, desc="Report Generate"):
         if _save_report(config, stock):
             saved += 1
     return saved
