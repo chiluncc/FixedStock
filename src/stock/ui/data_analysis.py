@@ -7,7 +7,7 @@ from tqdm import tqdm
 from stock.agent.agent import ReportAgent
 from stock.structures.config import Config
 from stock.structures.report import StockReport
-from stock.utils.file_handles import get_logger, json_save, txt_save
+from stock.utils.file_handles import get_logger, json_save
 from stock.utils.report_html import render_report_html
 from stock.utils.tools.auto import analyze_stock_reports
 
@@ -28,7 +28,6 @@ def _save_report(config: Config, stock: StockReport) -> bool:
     logger = get_logger(config.output_dir / "logging.log")
     folder = _report_folder(config)
     md = stock.as_md()
-    txt_save(md, folder / f"{stock.code}.md")
     try:
         html = render_report_html(md, config.local_data_dir / "market.db", stock.code)
     except Exception as exc:
