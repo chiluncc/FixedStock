@@ -1,13 +1,28 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from tqdm import tqdm
 
 from stock.agent.agent import ReportAgent
 from stock.structures.config import Config
 from stock.structures.report import StockReport
 from stock.utils.file_handles import get_logger, txt_save
+from stock.utils.report_html import render_report_html
 from stock.utils.tools.auto import analyze_stock_reports
+
+
+def _as_html(config: Config, stock: StockReport) -> Path:
+    folder = config.output_dir / "stocks" / f"stock_{stock.code}"
+    folder.mkdir(parents=True, exist_ok=True)
+    html = render_report_html(
+        stock.as_md(),
+        config.local_data_dir / "market.db",
+        stock.code,
+    )
+    out_path = folder / f"stock_{stock.code}.html"
+    out_path.write_text(html, encoding="utf-8")
+    return out_path
 
 
 def _get_foundation_data(config: Config) -> list[StockReport]:
@@ -22,6 +37,7 @@ def _save_date(config: Config, stocks: list[StockReport]) -> None:
         folder = out_root / f"stock_{stock.code}"
         folder.mkdir(parents=True, exist_ok=True)
         txt_save(stock.as_md(), folder / f"stock_{stock.code}.md")
+        _as_html(config, stock)
 
 
 def _llm_analysis(config: Config, stock: list[StockReport], threads: int = 16) -> list[StockReport]:
