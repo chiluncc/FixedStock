@@ -18,6 +18,7 @@ uv.lock
 
 # Tests
 tests
+logs
 
 # Data
 data
