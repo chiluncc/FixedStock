@@ -34,6 +34,7 @@ def load_config(config_path: Path) -> Config:
         stocks=raw["stocks"],
         time_start=datetime.strptime(raw["time_start"], "%Y-%m-%d"),
         time_position=int(raw["time_position"]),
+        portfolio_power=float(raw.get("portfolio_power", 0.7)),
     )
 
 

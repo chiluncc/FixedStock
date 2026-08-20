@@ -11,3 +11,4 @@ class Config:
 
     time_start: datetime = field(default_factory=datetime.now())
     time_position: int = field(default=20)
+    portfolio_power: float = field(default=0.7)
