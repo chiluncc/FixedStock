@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import random
 import time
 from typing import Any
 
@@ -32,8 +32,9 @@ from stock.structures.config import Config
 from stock.structures.report import StockReport
 from stock.utils.file_handles import get_default_logger, keys_llm_load
 
-MAX_LLM_ITERATIONS = 32
+MAX_LLM_ITERATIONS = 64
 MAX_OUTER_ROUNDS = 3
+LLM_RETRY_DELAYS = (2.0, 4.0, 8.0, 8.0, 8.0)
 
 
 class ReportAgent:
@@ -41,7 +42,6 @@ class ReportAgent:
         self.config = config
         self.logger = get_default_logger(logger)
         self._llm_call_count = 0
-        self._last_model_start = 0.0
 
     def __call__(self, report: StockReport) -> StockReport | None:
         if report.investment_summary is not None and report.investment_analysis is not None:
@@ -56,7 +56,6 @@ class ReportAgent:
     async def _run(self, report: StockReport) -> StockReport | None:
         self.logger.info("开始生成研报: %s(%s)", report.name, report.code)
         self._llm_call_count = 0
-        self._last_model_start = 0.0
         agent = await self._build_agent(report)
         session = create_agent_session(session_id=f"report_{report.code}", card=agent.card)
         user_prompt = build_user_prompt(
@@ -121,16 +120,8 @@ class ReportAgent:
         for tool in get_tools(self.config, report):
             agent.ability_manager.add_ability(tool.card, tool)
         await agent.register_callback(
-            AgentCallbackEvent.BEFORE_MODEL_CALL,
-            self._on_before_model_call,
-        )
-        await agent.register_callback(
             AgentCallbackEvent.AFTER_MODEL_CALL,
             self._on_after_model_call,
-        )
-        await agent.register_callback(
-            AgentCallbackEvent.AFTER_TOOL_CALL,
-            self._on_after_tool_call,
         )
         return agent
 
@@ -140,43 +131,50 @@ class ReportAgent:
         session: Any,
         user_prompt: str,
     ) -> None:
-        result = await agent.invoke(user_prompt, session=session)
+        result = None
+        retries = len(LLM_RETRY_DELAYS)
+        for attempt in range(retries + 1):
+            try:
+                result = await agent.invoke(user_prompt, session=session)
+                break
+            except Exception as exc:
+                if attempt >= retries:
+                    raise
+                delay = LLM_RETRY_DELAYS[attempt]
+                wait = 2.0 + random.uniform(0.0, max(0.0, delay - 2.0))
+                self.logger.warning(
+                    "模型调用失败，%.1fs 后重试（第 %d/%d 次）: %s",
+                    wait,
+                    attempt + 1,
+                    retries,
+                    exc,
+                )
+                await asyncio.sleep(wait)
         if isinstance(result, dict):
             output = result.get("output", "")
             if output:
                 self.logger.debug("LLM 最终答复: %s", output)
 
-    async def _on_before_model_call(self, ctx: AgentCallbackContext) -> None:
-        self._last_model_start = time.monotonic()
-
     async def _on_after_model_call(self, ctx: AgentCallbackContext) -> None:
-        elapsed = time.monotonic() - self._last_model_start
         self._llm_call_count += 1
         response = getattr(getattr(ctx, "inputs", None), "response", None)
+        reasoning = getattr(response, "reasoning_content", None)
+        if reasoning:
+            content = str(reasoning).replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+            self.logger.debug(
+                "第 %d 轮 [LLM]: %s",
+                self._llm_call_count,
+                content,
+            )
         tool_calls = getattr(response, "tool_calls", None) or []
-        tool_summary = [
-            f"{tc.name}({tc.arguments})"
+        tool_names = [
+            getattr(tc, "name", "")
             for tc in tool_calls
             if getattr(tc, "name", None)
         ]
-        self.logger.debug(
-            "LLM 第 %d 次调用完成，耗时 %.2fs，工具调用: %s",
-            self._llm_call_count,
-            elapsed,
-            "、".join(tool_summary) if tool_summary else "无",
-        )
-
-    async def _on_after_tool_call(self, ctx: AgentCallbackContext) -> None:
-        inputs = getattr(ctx, "inputs", None)
-        tool_name = getattr(inputs, "tool_name", "")
-        tool_args = getattr(inputs, "tool_args", None)
-        if isinstance(tool_args, dict):
-            tool_args = json.dumps(tool_args, ensure_ascii=False)
-        self.logger.debug("工具调用完成: %s(%s)", tool_name, tool_args)
-        tool_result = getattr(inputs, "tool_result", None)
-        if getattr(tool_result, "error", False):
-            self.logger.warning(
-                "工具调用返回错误: %s: %s",
-                tool_name,
-                getattr(tool_result, "error_str", ""),
+        if tool_names:
+            self.logger.debug(
+                "第 %d 轮 [Tool]: %s",
+                self._llm_call_count,
+                "; ".join(tool_names),
             )

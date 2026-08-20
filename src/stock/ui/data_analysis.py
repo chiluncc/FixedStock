@@ -83,7 +83,7 @@ def _save_date(config: Config, stocks: list[StockReport]) -> int:
     return saved
 
 
-def _llm_analysis(config: Config, stock: list[StockReport], threads: int = 16) -> list[StockReport]:
+def _llm_analysis(config: Config, stock: list[StockReport], threads: int = 4) -> list[StockReport] | None:
     main_logger = get_logger(config.output_dir / "logging.log")
 
     def _process_stock(stock: StockReport) -> StockReport | None:
@@ -100,11 +100,15 @@ def _llm_analysis(config: Config, stock: list[StockReport], threads: int = 16) -
             try:
                 result = future.result()
             except Exception as exc:
-                main_logger.error("股票 %s LLM 分析异常: %s", item.code, exc)
-                continue
+                main_logger.error("股票 %s LLM 分析异常，终止本次生成: %s", item.code, exc)
+                for pending in futures:
+                    pending.cancel()
+                return None
             if result is None:
-                main_logger.error("股票 %s LLM 分析未完成", item.code)
-                continue
+                main_logger.error("股票 %s LLM 分析未完成，终止本次生成", item.code)
+                for pending in futures:
+                    pending.cancel()
+                return None
             completed.append(result)
     return completed
 
@@ -113,6 +117,8 @@ def generate_analysis_data(config: Config) -> bool:
     try:
         stocks = _get_foundation_data(config)
         completed = _llm_analysis(config, stocks)
+        if completed is None:
+            return False
         _save_date(config, completed)
         _write_portfolio(config, completed)
         return len(completed) == len(stocks)
