@@ -1,7 +1,6 @@
 {
     "local_data_dir": "data",
     "output_dir": "output",
-    "time_start": "2026-08-20",
     "time_position": 20,
     "stocks": {
         "金融板块": [
